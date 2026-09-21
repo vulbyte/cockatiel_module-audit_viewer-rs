@@ -1,0 +1,36 @@
+{
+  "name": "cockatiel-audit-viewer",
+  "description": "Terminal audit viewer \u2014 live engine/module logs, recent message flow with pipeline status, error/failed rows, held-for-audit messages, and module health, all queried from the timeline.",
+  "version": "0.1.0",
+  "capabilities": "output",
+  "root_file": "./src/main.rs",
+  "launch_command": "cargo",
+  "command_flags": [
+    "run",
+    "--release"
+  ],
+  "autostart": false,
+  "terminal": true,
+  "binary": {
+    "macos": {
+      "x86_64": "target/release/cockatiel_audit_viewer",
+      "aarch64": "target/release/cockatiel_audit_viewer",
+      "arm": "target/release/cockatiel_audit_viewer"
+    },
+    "linux": {
+      "x86_64": "target/release/cockatiel_audit_viewer",
+      "aarch64": "target/release/cockatiel_audit_viewer",
+      "arm": "target/release/cockatiel_audit_viewer"
+    },
+    "windows": {
+      "x86_64": "target/release/cockatiel_audit_viewer.exe",
+      "aarch64": "target/release/cockatiel_audit_viewer.exe",
+      "arm": "target/release/cockatiel_audit_viewer.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ]
+}

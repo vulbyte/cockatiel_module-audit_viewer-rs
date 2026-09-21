@@ -1,0 +1,10 @@
+/target/
+config.json
+.env
+.env.local
+*.json
+!cockatiel_module_info.json
+*.db
+*.log
+.DS_Store
+__pycache__/
