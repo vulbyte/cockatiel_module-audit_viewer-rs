@@ -90,7 +90,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "cockatiel-client"
 version = "0.1.0"
-source = "git+https://github.com/vulbyte/cockatiel_client-rs?rev=1dae41ef48682fb1af0e230531842043791eb709#1dae41ef48682fb1af0e230531842043791eb709"
+source = "git+https://github.com/vulbyte/cockatiel_client-rs?rev=a74ebf1e63784be39876a55cf3a963933220bf15#a74ebf1e63784be39876a55cf3a963933220bf15"
 dependencies = [
  "cockatiel-proto",
  "futures-util",
@@ -105,7 +105,7 @@ dependencies = [
 [[package]]
 name = "cockatiel-proto"
 version = "0.1.0"
-source = "git+https://github.com/vulbyte/cockatiel_proto?rev=012845421731ccd8a9fc3e58ad1e89a4e4900fbe#012845421731ccd8a9fc3e58ad1e89a4e4900fbe"
+source = "git+https://github.com/vulbyte/cockatiel_proto?rev=94a881455e4fea9fa05d35739f3698ae6a43dc41#94a881455e4fea9fa05d35739f3698ae6a43dc41"
 dependencies = [
  "prost 0.14.4",
  "prost-build",
@@ -598,7 +598,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "log",
  "multimap",
  "once_cell",
@@ -618,7 +618,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -631,7 +631,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
