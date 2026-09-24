@@ -20,6 +20,10 @@ use tracing_subscriber::FmtSubscriber;
 use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient};
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
+mod config;
+
+use config::Config;
+
 type WsWriteHalf = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMessage,
@@ -47,6 +51,8 @@ struct EngineHandle {
     identity: Arc<Mutex<SessionIdentity>>,
     write: Arc<Mutex<WsWriteHalf>>,
     results: Arc<Mutex<broadcast::Sender<DatabaseQueryResult>>>,
+    query_timeout: Duration,
+    broadcast_cap: usize,
 }
 
 impl EngineHandle {
@@ -55,8 +61,10 @@ impl EngineHandle {
         module_name: String,
         instance_uuid7: String,
         write: WsWriteHalf,
+        broadcast_cap: usize,
+        query_timeout: Duration,
     ) -> Self {
-        let (results, _) = broadcast::channel(256);
+        let (results, _) = broadcast::channel(broadcast_cap);
         Self {
             identity: Arc::new(Mutex::new(SessionIdentity {
                 auth_token,
@@ -65,6 +73,8 @@ impl EngineHandle {
             })),
             write: Arc::new(Mutex::new(write)),
             results: Arc::new(Mutex::new(results)),
+            query_timeout,
+            broadcast_cap,
         }
     }
 
@@ -82,7 +92,7 @@ impl EngineHandle {
         instance_uuid7: String,
         write: WsWriteHalf,
     ) {
-        let (results, _) = broadcast::channel(256);
+        let (results, _) = broadcast::channel(self.broadcast_cap);
         *self.identity.lock().await = SessionIdentity {
             auth_token,
             module_name,
@@ -116,8 +126,8 @@ impl EngineHandle {
     }
 
     /// Send a DatabaseQuery and wait for its matching DatabaseQueryResult.
-    /// Fails fast: both the send and the wait are capped at 3s, so a dead
-    /// socket or a slow query can never stall a refresh.
+    /// Fails fast: both the send and the wait are capped at `query_timeout`, so
+    /// a dead socket or a slow query can never stall a refresh.
     async fn db_query(&self, query_id: &str, sql: &str) -> Result<DatabaseQueryResult, String> {
         let mut rx = self.results.lock().await.subscribe();
         let payload = Payload::DatabaseQuery(DatabaseQuery {
@@ -125,13 +135,13 @@ impl EngineHandle {
             sql: sql.to_string(),
             params: vec![],
         });
-        match tokio::time::timeout(Duration::from_secs(3), self.send_payload(payload)).await {
+        match tokio::time::timeout(self.query_timeout, self.send_payload(payload)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(format!("send timed out for '{}'", query_id)),
         }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -246,15 +256,13 @@ fn row_from_json(v: &serde_json::Value) -> Row {
     }
 }
 
-const LIVE_LOG_CAP: usize = 500;
-
 /// Append a live engine/module log line to the capped live buffer. This buffer
 /// is owned solely by the read loop; refresh() never writes to it.
-async fn push_live_log(data: &Arc<Mutex<AuditData>>, line: String) {
+async fn push_live_log(data: &Arc<Mutex<AuditData>>, line: String, cap: usize) {
     let mut d = data.lock().await;
     d.live_logs.push(line);
-    if d.live_logs.len() > LIVE_LOG_CAP {
-        let over = d.live_logs.len() - LIVE_LOG_CAP;
+    if d.live_logs.len() > cap {
+        let over = d.live_logs.len() - cap;
         d.live_logs.drain(0..over);
     }
 }
@@ -266,6 +274,7 @@ async fn handle_payload(
     results_tx: &broadcast::Sender<DatabaseQueryResult>,
     data: &Arc<Mutex<AuditData>>,
     payload: Payload,
+    live_log_cap: usize,
 ) {
     match payload {
         // Answer the engine's liveness probe with our current auth token.
@@ -278,10 +287,10 @@ async fn handle_payload(
         Payload::DatabaseQueryResult(qr) => {
             let _ = results_tx.send(qr);
         }
-        Payload::Log(log) => push_live_log(data, format!("[engine] {}", log.log)).await,
-        Payload::Err(err) => push_live_log(data, format!("[error] {}", err.log)).await,
+        Payload::Log(log) => push_live_log(data, format!("[engine] {}", log.log), live_log_cap).await,
+        Payload::Err(err) => push_live_log(data, format!("[error] {}", err.log), live_log_cap).await,
         Payload::ModuleControlResult(result) => {
-            push_live_log(data, format!("[module] {}", result.message)).await
+            push_live_log(data, format!("[module] {}", result.message), live_log_cap).await
         }
         _ => {}
     }
@@ -289,14 +298,19 @@ async fn handle_payload(
 
 /// Read from the engine until the socket drops (returns on Close / error /
 /// stream end). Forwards query results and live logs into shared state.
-async fn run_read_loop(mut read: WsReadHalf, engine: EngineHandle, data: Arc<Mutex<AuditData>>) {
+async fn run_read_loop(
+    mut read: WsReadHalf,
+    engine: EngineHandle,
+    data: Arc<Mutex<AuditData>>,
+    live_log_cap: usize,
+) {
     let results_tx = engine.result_sender().await;
     while let Some(msg) = read.next().await {
         match msg {
             Ok(WsMessage::Binary(bin)) => {
                 if let Ok(container) = Container::decode(bin.as_ref()) {
                     if let Some(payload) = container.payload {
-                        handle_payload(&engine, &results_tx, &data, payload).await;
+                        handle_payload(&engine, &results_tx, &data, payload, live_log_cap).await;
                     }
                 }
             }
@@ -317,6 +331,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
+    let config = Config::load_or_default();
+
     let cockatiel = CockatielClient::connect("audit-viewer.json").await?;
     let (write, read) = cockatiel.stream.split();
     let engine = EngineHandle::new(
@@ -324,6 +340,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cockatiel.config.module_name.clone(),
         cockatiel.instance_uuid7.clone(),
         write,
+        config.broadcast_cap,
+        Duration::from_secs(config.query_timeout_secs),
     );
     let data: Arc<Mutex<AuditData>> = Arc::new(Mutex::new(AuditData {
         connected: true,
@@ -332,17 +350,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connection supervisor: owns the read loop and the reconnect lifecycle.
     // When the socket drops it marks the viewer disconnected (the poll loop
-    // stops querying) and reconnects with exponential backoff (1s, 2s, 4s ...
-    // cap 30s), swapping in a fresh session so every task uses the CURRENT
-    // connection. This replaces the old behavior where the read task silently
-    // exited on socket close and the poll task drew stale data forever.
+    // stops querying) and reconnects with exponential backoff, swapping in a
+    // fresh session so every task uses the CURRENT connection. This replaces
+    // the old behavior where the read task silently exited on socket close and
+    // the poll task drew stale data forever.
     {
         let engine = engine.clone();
         let data = Arc::clone(&data);
+        let live_log_cap = config.live_log_cap;
+        let reconnect_base = config.reconnect_base_secs;
+        let reconnect_max = config.reconnect_max_secs;
         tokio::spawn(async move {
             let mut read = read;
             'session: loop {
-                run_read_loop(read, engine.clone(), Arc::clone(&data)).await;
+                run_read_loop(read, engine.clone(), Arc::clone(&data), live_log_cap).await;
 
                 // The engine connection dropped.
                 {
@@ -351,8 +372,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     d.reconnect_msg = Some("disconnected — reconnecting...".to_string());
                 }
 
-                // Reconnect with exponential backoff (1s, 2s, 4s ... cap 30s).
-                let mut backoff = 1u64;
+                // Reconnect with exponential backoff.
+                let mut backoff = reconnect_base;
                 loop {
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                     match CockatielClient::connect("audit-viewer.json").await {
@@ -375,7 +396,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue 'session;
                         }
                         Err(e) => {
-                            backoff = (backoff * 2).min(30);
+                            backoff = (backoff * 2).min(reconnect_max);
                             let mut d = data.lock().await;
                             d.reconnect_msg = Some(format!(
                                 "reconnecting in {}s ({} failed)",
@@ -388,17 +409,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Poll task: refresh the timeline + module list every few seconds, but only
-    // while connected — a dead socket must not be hammered with db_query.
+    // Poll task: refresh the timeline + module list on the configured interval,
+    // but only while connected — a dead socket must not be hammered with
+    // db_query.
     {
         let data = Arc::clone(&data);
         let engine = engine.clone();
+        let poll_cfg = config.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3));
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(poll_cfg.refresh_interval_secs));
             loop {
                 interval.tick().await;
                 if data.lock().await.connected {
-                    refresh(&engine, &data).await;
+                    refresh(&engine, &data, &poll_cfg).await;
                 }
             }
         });
@@ -410,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     crossterm::terminal::enable_raw_mode()?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_tui(&mut terminal, engine, data).await;
+    let result = run_tui(&mut terminal, engine, data, &config).await;
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
@@ -440,11 +464,14 @@ async fn query_rows(engine: &EngineHandle, query_id: &str, sql: &str) -> Option<
 }
 
 /// Archival timeline rows (module connect/disconnect, module logs, sends).
-async fn query_archive_logs(engine: &EngineHandle) -> Option<Vec<String>> {
+async fn query_archive_logs(engine: &EngineHandle, log_limit: i64) -> Option<Vec<String>> {
     let qr = engine
         .db_query(
             "audit_logs",
-            "SELECT raw_message, flags, persisted_at FROM timeline_events WHERE event_type = 5 ORDER BY persisted_at DESC LIMIT 40",
+            &format!(
+                "SELECT raw_message, flags, persisted_at FROM timeline_events WHERE event_type = 5 ORDER BY persisted_at DESC LIMIT {}",
+                log_limit
+            ),
         )
         .await
         .ok()?;
@@ -483,28 +510,29 @@ async fn query_modules(engine: &EngineHandle) -> Option<Vec<serde_json::Value>> 
     Some(v.as_array().cloned().unwrap_or_default())
 }
 
-async fn refresh(engine: &EngineHandle, data: &Arc<Mutex<AuditData>>) {
-    // Run all five queries CONCURRENTLY — each capped at ~3s inside db_query —
-    // so a single slow or hung query can never stall the whole refresh (old
-    // behavior: five sequential 10s deadlines = 50s worst case). The live log
-    // buffer is NOT part of the refresh; only the archival views are updated.
+async fn refresh(engine: &EngineHandle, data: &Arc<Mutex<AuditData>>, config: &Config) {
+    // Run all five queries CONCURRENTLY — each capped at `query_timeout` inside
+    // db_query — so a single slow or hung query can never stall the whole
+    // refresh (old behavior: five sequential 10s deadlines = 50s worst case).
+    // The live log buffer is NOT part of the refresh; only the archival views
+    // are updated.
+    let msgs_sql = format!(
+        "SELECT platform, raw_message, user_uuid7, pipeline_status, error_message, persisted_at FROM timeline_events WHERE event_type = 1 ORDER BY persisted_at DESC LIMIT {}",
+        config.messages_limit
+    );
+    let errs_sql = format!(
+        "SELECT platform, raw_message, pipeline_status, error_message, persisted_at FROM timeline_events WHERE (error_message IS NOT NULL AND error_message != '') OR pipeline_status = 'failed' ORDER BY persisted_at DESC LIMIT {}",
+        config.errors_limit
+    );
+    let held_sql = format!(
+        "SELECT platform, raw_message, pipeline_status, persisted_at FROM timeline_events WHERE pipeline_status = 'audit' ORDER BY persisted_at DESC LIMIT {}",
+        config.audit_limit
+    );
     let (msgs, errs, held, logs, mods) = tokio::join!(
-        query_rows(
-            engine,
-            "audit_msgs",
-            "SELECT platform, raw_message, user_uuid7, pipeline_status, error_message, persisted_at FROM timeline_events WHERE event_type = 1 ORDER BY persisted_at DESC LIMIT 60",
-        ),
-        query_rows(
-            engine,
-            "audit_err",
-            "SELECT platform, raw_message, pipeline_status, error_message, persisted_at FROM timeline_events WHERE (error_message IS NOT NULL AND error_message != '') OR pipeline_status = 'failed' ORDER BY persisted_at DESC LIMIT 40",
-        ),
-        query_rows(
-            engine,
-            "audit_held",
-            "SELECT platform, raw_message, pipeline_status, persisted_at FROM timeline_events WHERE pipeline_status = 'audit' ORDER BY persisted_at DESC LIMIT 40",
-        ),
-        query_archive_logs(engine),
+        query_rows(engine, "audit_msgs", &msgs_sql),
+        query_rows(engine, "audit_err", &errs_sql),
+        query_rows(engine, "audit_held", &held_sql),
+        query_archive_logs(engine, config.log_limit),
         query_modules(engine),
     );
 
@@ -533,6 +561,7 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     engine: EngineHandle,
     data: Arc<Mutex<AuditData>>,
+    config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut tab = Tab::Messages;
     let mut scroll = 0usize;
@@ -549,7 +578,7 @@ async fn run_tui(
                             // a dead socket would fail fast, but there's nothing
                             // to query for until the supervisor reconnects.
                             if data.lock().await.connected {
-                                refresh(&engine, &data).await;
+                                refresh(&engine, &data, config).await;
                             }
                         }
                         KeyCode::Tab => {
