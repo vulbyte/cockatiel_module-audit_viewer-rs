@@ -8,23 +8,23 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     /// How often the poll task refreshes the timeline + module list (seconds).
-    pub refresh_interval_secs: u64,
+    pub refresh_interval_secs: u32,
     /// Deadline for a db_query / timeline_query send AND response wait (seconds).
-    pub query_timeout_secs: u64,
+    pub query_timeout_secs: u32,
     /// Cap on the live engine/module log buffer.
     pub live_log_cap: usize,
     /// `LIMIT` for the archival log query.
-    pub log_limit: i64,
+    pub log_limit: i32,
     /// `LIMIT` for the messages query.
-    pub messages_limit: i64,
+    pub messages_limit: i32,
     /// `LIMIT` for the errors query.
-    pub errors_limit: i64,
+    pub errors_limit: i32,
     /// `LIMIT` for the audit (held) query.
-    pub audit_limit: i64,
+    pub audit_limit: i32,
     /// Initial reconnect backoff (seconds).
-    pub reconnect_base_secs: u64,
+    pub reconnect_base_secs: u32,
     /// Reconnect backoff cap (seconds).
-    pub reconnect_max_secs: u64,
+    pub reconnect_max_secs: u32,
     /// Capacity of the engine result broadcast channel.
     pub broadcast_cap: usize,
 }

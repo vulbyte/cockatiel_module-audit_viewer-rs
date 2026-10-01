@@ -398,7 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cockatiel.instance_uuid7.clone(),
         write,
         config.broadcast_cap,
-        Duration::from_secs(config.query_timeout_secs),
+        Duration::from_secs(config.query_timeout_secs as u64),
     );
     let data: Arc<Mutex<AuditData>> = Arc::new(Mutex::new(AuditData {
         connected: true,
@@ -432,7 +432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Reconnect with exponential backoff.
                 let mut backoff = reconnect_base;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
                     match CockatielClient::connect("audit-viewer.json").await {
                         Ok(conn) => {
                             let (w, r) = conn.stream.split();
@@ -475,7 +475,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let poll_cfg = config.clone();
         tokio::spawn(async move {
             let mut interval =
-                tokio::time::interval(Duration::from_secs(poll_cfg.refresh_interval_secs));
+                tokio::time::interval(Duration::from_secs(poll_cfg.refresh_interval_secs as u64));
             loop {
                 interval.tick().await;
                 if data.lock().await.connected {
@@ -508,7 +508,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// mirrors the values the engine persists (1 = user message, 5 = archival
 /// lifecycle/send event); `pipeline_status` filters e.g. the held-for-audit
 /// queue on the server side. `request_id` correlates the reply.
-fn timeline_query(request_id: &str, event_type: i32, pipeline_status: &str, limit: i64) -> TimelineQuery {
+fn timeline_query(request_id: &str, event_type: i32, pipeline_status: &str, limit: i32) -> TimelineQuery {
     TimelineQuery {
         timeline_id_uuid7: String::new(),
         request_id: request_id.to_string(),
@@ -519,7 +519,7 @@ fn timeline_query(request_id: &str, event_type: i32, pipeline_status: &str, limi
         since_ms: 0,
         raw_prefix: String::new(),
         pipeline_status: pipeline_status.to_string(),
-        limit: limit.clamp(0, i32::MAX as i64) as i32,
+        limit: limit.clamp(0, i32::MAX),
         offset: 0,
     }
 }
@@ -532,7 +532,7 @@ async fn query_timeline_rows(
     request_id: &str,
     event_type: i32,
     pipeline_status: &str,
-    limit: i64,
+    limit: i32,
 ) -> Option<Vec<Row>> {
     let qr = engine
         .timeline_query(request_id, timeline_query(request_id, event_type, pipeline_status, limit))
@@ -544,7 +544,7 @@ async fn query_timeline_rows(
 /// Error rows: user messages whose pipeline failed or that carried an error.
 /// The engine filters by event_type only; `error_message` and `pipeline_status`
 /// are both on the proto, so the error/failed test happens client-side.
-async fn query_error_rows(engine: &EngineHandle, request_id: &str, limit: i64) -> Option<Vec<Row>> {
+async fn query_error_rows(engine: &EngineHandle, request_id: &str, limit: i32) -> Option<Vec<Row>> {
     let qr = engine
         .timeline_query(request_id, timeline_query(request_id, 1, "", limit))
         .await
@@ -560,7 +560,7 @@ async fn query_error_rows(engine: &EngineHandle, request_id: &str, limit: i64) -
 
 /// Archival timeline rows (module connect/disconnect, module logs, sends) —
 /// the engine persists these as `event_type = 5`.
-async fn query_archive_logs(engine: &EngineHandle, log_limit: i64) -> Option<Vec<String>> {
+async fn query_archive_logs(engine: &EngineHandle, log_limit: i32) -> Option<Vec<String>> {
     let qr = engine
         .timeline_query("audit_logs", timeline_query("audit_logs", 5, "", log_limit))
         .await
