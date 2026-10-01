@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// How often the poll task refreshes the timeline + module list (seconds).
     pub refresh_interval_secs: u64,
-    /// Deadline for a db_query send AND response wait (seconds).
+    /// Deadline for a db_query / timeline_query send AND response wait (seconds).
     pub query_timeout_secs: u64,
     /// Cap on the live engine/module log buffer.
     pub live_log_cap: usize,

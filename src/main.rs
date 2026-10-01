@@ -49,11 +49,21 @@ struct SessionIdentity {
     instance_uuid7: String,
 }
 
+/// One engine reply, tagged by which query surface produced it. Both the
+/// legacy `DatabaseQuery` path (module_list / db_status / userdb_*) and the
+/// typed `TimelineQuery` path (the timeline tabs) land on the same broadcast
+/// channel; the matching helper subscribes and keeps only its own replies.
+#[derive(Clone)]
+enum QueryReply {
+    Db(DatabaseQueryResult),
+    Timeline(TimelineQueryResult),
+}
+
 #[derive(Clone)]
 struct EngineHandle {
     identity: Arc<Mutex<SessionIdentity>>,
     write: Arc<Mutex<WsWriteHalf>>,
-    results: Arc<Mutex<broadcast::Sender<DatabaseQueryResult>>>,
+    results: Arc<Mutex<broadcast::Sender<QueryReply>>>,
     query_timeout: Duration,
     broadcast_cap: usize,
 }
@@ -81,13 +91,13 @@ impl EngineHandle {
         }
     }
 
-    async fn result_sender(&self) -> broadcast::Sender<DatabaseQueryResult> {
+    async fn result_sender(&self) -> broadcast::Sender<QueryReply> {
         self.results.lock().await.clone()
     }
 
     /// Swap in a fresh session (write half + identity + result channel) after a
-    /// reconnect. Old db_query subscribers see Err(Closed) and fail fast
-    /// instead of waiting on a dead connection.
+    /// reconnect. Old db_query / timeline_query subscribers see Err(Closed) and
+    /// fail fast instead of waiting on a dead connection.
     async fn swap_session(
         &self,
         auth_token: String,
@@ -151,13 +161,50 @@ impl EngineHandle {
                 return Err(format!("timed out waiting for '{}'", query_id));
             }
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(res)) => {
+                Ok(Ok(QueryReply::Db(res))) => {
                     if res.query_id == query_id {
                         return Ok(res);
                     }
                 }
+                // Not our reply — a concurrent timeline_query's; keep waiting.
+                Ok(Ok(QueryReply::Timeline(_))) => {}
                 Ok(Err(_)) => return Err("query channel closed".into()),
                 Err(_) => return Err(format!("timed out waiting for '{}'", query_id)),
+            }
+        }
+    }
+
+    /// Send a typed TimelineQuery and wait for its matching TimelineQueryResult,
+    /// correlated on `request_id`. Same fail-fast semantics as `db_query`.
+    async fn timeline_query(
+        &self,
+        request_id: &str,
+        query: TimelineQuery,
+    ) -> Result<TimelineQueryResult, String> {
+        let mut rx = self.results.lock().await.subscribe();
+        let payload = EnginePayload::TimelineQuery(query);
+        match tokio::time::timeout(self.query_timeout, self.send_payload(payload)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(format!("send timed out for '{}'", request_id)),
+        }
+
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("timed out waiting for '{}'", request_id));
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(QueryReply::Timeline(res))) => {
+                    if res.request_id == request_id {
+                        return Ok(res);
+                    }
+                }
+                // Not our reply — a concurrent db_query's; keep waiting.
+                Ok(Ok(QueryReply::Db(_))) => {}
+                Ok(Err(_)) => return Err("query channel closed".into()),
+                Err(_) => return Err(format!("timed out waiting for '{}'", request_id)),
             }
         }
     }
@@ -248,14 +295,18 @@ fn rel_time(ms: Option<i64>) -> String {
     }
 }
 
-fn row_from_json(v: &serde_json::Value) -> Row {
+/// Build a `Row` from a typed `TimelineEvent`. The engine maps the timeline
+/// DB's `platform` column onto `stream_origin` and `flags` onto `raw_flags`;
+/// `persisted_at` is NOT carried on the proto, so `age` stays blank (the TUI
+/// tolerates that — only the relative-age prefix disappears).
+fn row_from_event(e: &TimelineEvent) -> Row {
     Row {
-        platform: cell(v.get("platform").unwrap_or(&serde_json::Value::Null)),
-        user: cell(v.get("user_uuid7").unwrap_or(&serde_json::Value::Null)),
-        content: cell(v.get("raw_message").unwrap_or(&serde_json::Value::Null)),
-        status: cell(v.get("pipeline_status").unwrap_or(&serde_json::Value::Null)),
-        error: cell(v.get("error_message").unwrap_or(&serde_json::Value::Null)),
-        age: rel_time(v.get("persisted_at").and_then(|x| x.as_i64())),
+        platform: e.stream_origin.clone(),
+        user: e.user_uuid7.clone(),
+        content: e.raw_message.clone(),
+        status: e.pipeline_status.clone(),
+        error: e.error_message.clone(),
+        age: String::new(),
     }
 }
 
@@ -274,7 +325,7 @@ async fn push_live_log(data: &Arc<Mutex<AuditData>>, line: String, cap: usize) {
 /// channel, capture live engine/module logs, answer liveness probes.
 async fn handle_payload(
     engine: &EngineHandle,
-    results_tx: &broadcast::Sender<DatabaseQueryResult>,
+    results_tx: &broadcast::Sender<QueryReply>,
     data: &Arc<Mutex<AuditData>>,
     payload: ModulePayload,
     live_log_cap: usize,
@@ -288,7 +339,10 @@ async fn handle_payload(
                 .await;
         }
         ModulePayload::DatabaseQueryResult(qr) => {
-            let _ = results_tx.send(qr);
+            let _ = results_tx.send(QueryReply::Db(qr));
+        }
+        ModulePayload::TimelineQueryResult(qr) => {
+            let _ = results_tx.send(QueryReply::Timeline(qr));
         }
         ModulePayload::Log(log) => push_live_log(data, format!("[engine] {}", log.log), live_log_cap).await,
         ModulePayload::Err(err) => push_live_log(data, format!("[error] {}", err.log), live_log_cap).await,
@@ -414,7 +468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Poll task: refresh the timeline + module list on the configured interval,
     // but only while connected — a dead socket must not be hammered with
-    // db_query.
+    // queries.
     {
         let data = Arc::clone(&data);
         let engine = engine.clone();
@@ -450,52 +504,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Run one timeline query and parse its rows. Returns None on any failure
-/// (connection error, query failure, malformed blob) so a failed query simply
-/// leaves the previous tab content in place.
-async fn query_rows(engine: &EngineHandle, query_id: &str, sql: &str) -> Option<Vec<Row>> {
-    let qr = engine.db_query(query_id, sql).await.ok()?;
-    if !qr.success {
-        return None;
+/// Build the typed `TimelineQuery` for one of the timeline tabs. `event_type`
+/// mirrors the values the engine persists (1 = user message, 5 = archival
+/// lifecycle/send event); `pipeline_status` filters e.g. the held-for-audit
+/// queue on the server side. `request_id` correlates the reply.
+fn timeline_query(request_id: &str, event_type: i32, pipeline_status: &str, limit: i64) -> TimelineQuery {
+    TimelineQuery {
+        timeline_id_uuid7: String::new(),
+        request_id: request_id.to_string(),
+        event_type,
+        platform: String::new(),
+        user_uuid7: String::new(),
+        kind: String::new(),
+        since_ms: 0,
+        raw_prefix: String::new(),
+        pipeline_status: pipeline_status.to_string(),
+        limit: limit.clamp(0, i32::MAX as i64) as i32,
+        offset: 0,
     }
-    let v = serde_json::from_slice::<serde_json::Value>(&qr.result_blob).ok()?;
+}
+
+/// Run one TimelineQuery and parse its events into `Row`s. Returns None on any
+/// failure (connection error, query failure) so a failed query simply leaves
+/// the previous tab content in place.
+async fn query_timeline_rows(
+    engine: &EngineHandle,
+    request_id: &str,
+    event_type: i32,
+    pipeline_status: &str,
+    limit: i64,
+) -> Option<Vec<Row>> {
+    let qr = engine
+        .timeline_query(request_id, timeline_query(request_id, event_type, pipeline_status, limit))
+        .await
+        .ok()?;
+    Some(qr.events.iter().map(row_from_event).collect())
+}
+
+/// Error rows: user messages whose pipeline failed or that carried an error.
+/// The engine filters by event_type only; `error_message` and `pipeline_status`
+/// are both on the proto, so the error/failed test happens client-side.
+async fn query_error_rows(engine: &EngineHandle, request_id: &str, limit: i64) -> Option<Vec<Row>> {
+    let qr = engine
+        .timeline_query(request_id, timeline_query(request_id, 1, "", limit))
+        .await
+        .ok()?;
     Some(
-        v.as_array()
-            .map(|a| a.iter().map(row_from_json).collect())
-            .unwrap_or_default(),
+        qr.events
+            .iter()
+            .filter(|e| !e.error_message.is_empty() || e.pipeline_status == "failed")
+            .map(row_from_event)
+            .collect(),
     )
 }
 
-/// Archival timeline rows (module connect/disconnect, module logs, sends).
+/// Archival timeline rows (module connect/disconnect, module logs, sends) —
+/// the engine persists these as `event_type = 5`.
 async fn query_archive_logs(engine: &EngineHandle, log_limit: i64) -> Option<Vec<String>> {
     let qr = engine
-        .db_query(
-            "audit_logs",
-            &format!(
-                "SELECT raw_message, flags, persisted_at FROM timeline_events WHERE event_type = 5 ORDER BY persisted_at DESC LIMIT {}",
-                log_limit
-            ),
-        )
+        .timeline_query("audit_logs", timeline_query("audit_logs", 5, "", log_limit))
         .await
         .ok()?;
-    if !qr.success {
-        return None;
-    }
-    let v = serde_json::from_slice::<serde_json::Value>(&qr.result_blob).ok()?;
-    let arr = v.as_array()?;
     let mut lines: Vec<String> = Vec::new();
-    for r in arr {
-        let msg = cell(r.get("raw_message").unwrap_or(&serde_json::Value::Null));
-        let flags = cell(r.get("flags").unwrap_or(&serde_json::Value::Null));
-        let age = rel_time(r.get("persisted_at").and_then(|x| x.as_i64()));
-        let kind = serde_json::from_str::<serde_json::Value>(&flags)
+    for e in &qr.events {
+        let msg = &e.raw_message;
+        let flags = &e.raw_flags;
+        let kind = serde_json::from_str::<serde_json::Value>(flags)
             .ok()
             .and_then(|f| f.get("kind").cloned())
             .map(|v| cell(&v))
             .unwrap_or_default();
         lines.push(format!(
             "[{} {}] {}",
-            age,
+            "", // age: persisted_at isn't carried on TimelineEvent
             if kind.is_empty() { "archive" } else { &kind },
             msg
         ));
@@ -515,26 +596,13 @@ async fn query_modules(engine: &EngineHandle) -> Option<Vec<serde_json::Value>> 
 
 async fn refresh(engine: &EngineHandle, data: &Arc<Mutex<AuditData>>, config: &Config) {
     // Run all five queries CONCURRENTLY — each capped at `query_timeout` inside
-    // db_query — so a single slow or hung query can never stall the whole
-    // refresh (old behavior: five sequential 10s deadlines = 50s worst case).
-    // The live log buffer is NOT part of the refresh; only the archival views
-    // are updated.
-    let msgs_sql = format!(
-        "SELECT platform, raw_message, user_uuid7, pipeline_status, error_message, persisted_at FROM timeline_events WHERE event_type = 1 ORDER BY persisted_at DESC LIMIT {}",
-        config.messages_limit
-    );
-    let errs_sql = format!(
-        "SELECT platform, raw_message, pipeline_status, error_message, persisted_at FROM timeline_events WHERE (error_message IS NOT NULL AND error_message != '') OR pipeline_status = 'failed' ORDER BY persisted_at DESC LIMIT {}",
-        config.errors_limit
-    );
-    let held_sql = format!(
-        "SELECT platform, raw_message, pipeline_status, persisted_at FROM timeline_events WHERE pipeline_status = 'audit' ORDER BY persisted_at DESC LIMIT {}",
-        config.audit_limit
-    );
+    // timeline_query / db_query — so a single slow or hung query can never stall
+    // the whole refresh. The live log buffer is NOT part of the refresh; only
+    // the archival views are updated.
     let (msgs, errs, held, logs, mods) = tokio::join!(
-        query_rows(engine, "audit_msgs", &msgs_sql),
-        query_rows(engine, "audit_err", &errs_sql),
-        query_rows(engine, "audit_held", &held_sql),
+        query_timeline_rows(engine, "audit_msgs", 1, "", config.messages_limit),
+        query_error_rows(engine, "audit_err", config.errors_limit),
+        query_timeline_rows(engine, "audit_held", 0, "audit", config.audit_limit),
         query_archive_logs(engine, config.log_limit),
         query_modules(engine),
     );
@@ -577,7 +645,7 @@ async fn run_tui(
                     match code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('r') => {
-                            // Skip the refresh while disconnected — db_query on
+                            // Skip the refresh while disconnected — a query on
                             // a dead socket would fail fast, but there's nothing
                             // to query for until the supervisor reconnects.
                             if data.lock().await.connected {
