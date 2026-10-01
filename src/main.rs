@@ -17,7 +17,10 @@ use tokio::sync::{broadcast, Mutex};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
-use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient};
+use cockatiel_client::proto::container_for_engine::Payload as EnginePayload;
+use cockatiel_client::proto::container_for_module::Payload as ModulePayload;
+use cockatiel_client::proto::*;
+use cockatiel_client::CockatielClient;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 mod config;
@@ -102,13 +105,13 @@ impl EngineHandle {
         *self.results.lock().await = results;
     }
 
-    pub async fn send_payload(&self, payload: Payload) -> Result<(), String> {
+    pub async fn send_payload(&self, payload: EnginePayload) -> Result<(), String> {
         let (auth_token, module_name, instance_uuid7) = {
             let id = self.identity.lock().await;
             (id.auth_token.clone(), id.module_name.clone(), id.instance_uuid7.clone())
         };
-        let container = Container {
-            version: 1,
+        let container = ContainerForEngine {
+            version: 2,
             auth_token,
             module_name,
             module_instance_uuid7: instance_uuid7,
@@ -130,7 +133,7 @@ impl EngineHandle {
     /// a dead socket or a slow query can never stall a refresh.
     async fn db_query(&self, query_id: &str, sql: &str) -> Result<DatabaseQueryResult, String> {
         let mut rx = self.results.lock().await.subscribe();
-        let payload = Payload::DatabaseQuery(DatabaseQuery {
+        let payload = EnginePayload::DatabaseQuery(DatabaseQuery {
             query_id: query_id.to_string(),
             sql: sql.to_string(),
             params: vec![],
@@ -273,23 +276,23 @@ async fn handle_payload(
     engine: &EngineHandle,
     results_tx: &broadcast::Sender<DatabaseQueryResult>,
     data: &Arc<Mutex<AuditData>>,
-    payload: Payload,
+    payload: ModulePayload,
     live_log_cap: usize,
 ) {
     match payload {
         // Answer the engine's liveness probe with our current auth token.
-        Payload::AuthVerify(_) => {
+        ModulePayload::AuthVerify(_) => {
             let cur_auth = engine.identity.lock().await.auth_token.clone();
             let _ = engine
-                .send_payload(Payload::AuthVerify(AuthVerify { cur_auth }))
+                .send_payload(EnginePayload::AuthVerify(AuthVerify { cur_auth }))
                 .await;
         }
-        Payload::DatabaseQueryResult(qr) => {
+        ModulePayload::DatabaseQueryResult(qr) => {
             let _ = results_tx.send(qr);
         }
-        Payload::Log(log) => push_live_log(data, format!("[engine] {}", log.log), live_log_cap).await,
-        Payload::Err(err) => push_live_log(data, format!("[error] {}", err.log), live_log_cap).await,
-        Payload::ModuleControlResult(result) => {
+        ModulePayload::Log(log) => push_live_log(data, format!("[engine] {}", log.log), live_log_cap).await,
+        ModulePayload::Err(err) => push_live_log(data, format!("[error] {}", err.log), live_log_cap).await,
+        ModulePayload::ModuleControlResult(result) => {
             push_live_log(data, format!("[module] {}", result.message), live_log_cap).await
         }
         _ => {}
@@ -308,7 +311,7 @@ async fn run_read_loop(
     while let Some(msg) = read.next().await {
         match msg {
             Ok(WsMessage::Binary(bin)) => {
-                if let Ok(container) = Container::decode(bin.as_ref()) {
+                if let Ok(container) = ContainerForModule::decode(bin.as_ref()) {
                     if let Some(payload) = container.payload {
                         handle_payload(&engine, &results_tx, &data, payload, live_log_cap).await;
                     }
