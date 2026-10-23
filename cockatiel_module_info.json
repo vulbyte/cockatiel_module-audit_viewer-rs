@@ -9,7 +9,7 @@
     "run",
     "--release"
   ],
-  "autostart": true,
+  "autostart": false,
   "terminal": true,
   "binary": {
     "macos": {
